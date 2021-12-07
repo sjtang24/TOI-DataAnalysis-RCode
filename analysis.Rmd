@@ -1,0 +1,339 @@
+```{r library loading, include=FALSE}
+library(ggplot2)
+library(GGally)
+library(corrplot)
+library(ClusterR)
+library(tidyverse)
+library(pROC)
+library(bestglm)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(xgboost)
+library(FNN)
+library(e1071)
+library(gt)
+```
+
+```{r importing code}
+url.path <- "https://raw.githubusercontent.com/pefreeman/36-290/b30362fcff9199631a1f29ec83e60bd5d3b37a6f/PROJECT_DATASETS/TOI/toi.csv"
+toi.df <- read.csv(url(url.path))
+```
+
+```{r variable transformations}
+toi.df$pl_eqt.log <- log(toi.df$pl_eqt)
+toi.df$pl_insol.log <- log(toi.df$pl_insol)
+toi.df$pl_orbper.log <- log(toi.df$pl_orbper)
+toi.df$pl_rade.log <- log(toi.df$pl_rade)
+toi.df$pl_transdep.log <- log(toi.df$pl_trandep)
+toi.df$pl_transdurh.log <- log(toi.df$pl_trandurh)
+toi.df$st_dist.log <- log(toi.df$st_dist)
+toi.df$st_rad.log <- log(toi.df$st_rad)
+toi.df$st_teff.log <- log(toi.df$st_teff)
+toi.df$abslog.pmdec <- log(abs(toi.df$st_pmdec))
+toi.df$abslog.pmra <- log(abs(toi.df$st_pmra))
+
+toi.df <- toi.df %>% 
+  dplyr::select(-c(pl_eqt, pl_insol, pl_orbper, pl_rade, pl_trandep, pl_trandurh,
+                   st_dist, st_rad, st_teff, st_pmdec, st_pmra)) %>% 
+  dplyr::filter(st_teff.log < 9.25 & st_logg > 3.25 & st_logg < 5.25 & abslog.pmdec > -2.5
+                & abslog.pmra > -2 & pl_rade.log < 4 & pl_orbper.log < 4)
+```
+
+```{r data visualizations via histogram}
+toi.df %>% 
+  tidyr::gather(., variable, value, -label) %>% 
+  ggplot(., mapping = aes(x = value)) +
+  geom_histogram(fill = "navyblue", alpha = 0.5, bins=40) +
+  facet_wrap(~variable, scales = "free") + 
+  theme(axis.text = element_text(size = 6)) +
+  labs(x = "",
+       title = "Histogram of the Distribution of Variables")
+```
+
+```{r data viz with labels removed and PCs filtered via boxplot}
+toi.df.nonpc <- toi.df %>% filter(label != "PC")
+toi.df.pc <- toi.df %>% filter(label == "PC")
+
+toi.df.nonpc %>% 
+  gather(., variable, value, -label) %>% 
+  ggplot(., mapping = aes(x = rep(toi.df.nonpc$label, 15), y=value, color = label)) +
+  geom_boxplot(alpha = 0.5) +
+  facet_wrap(~variable, nrow=3, scale='free_y') + 
+  theme(legend.position="none") + 
+  labs(x = "", y="")
+```
+
+```{r corrplot, out.width="75%", fig.align="center", echo=FALSE}
+toi.df.nonpc %>% 
+  dplyr::select(., -label) %>% 
+  cor(.) %>% 
+  corrplot(., method = "ellipse")
+```
+
+```{r splitting data}
+set.seed(7)
+
+train <- 0.70
+n <- nrow(toi.df.nonpc)
+indices <- sample(n, n * train)
+nonpc.train <- toi.df.nonpc[indices,]
+nonpc.test <- toi.df.nonpc[-indices,]
+```
+
+```{r logistic regression, echo=FALSE}
+set.seed(7)
+glm.init <- glm(factor(nonpc.train$label)~., data=nonpc.train, family=binomial)
+prob.init <- predict(glm.init, newdata=nonpc.test, type="response")
+roc.glm <- suppressMessages(roc(nonpc.test$label, prob.init))
+(glm.auc <- roc.glm$auc)
+```
+
+```{r subset selection, echo=FALSE}
+log_forward = function(pred.train,resp.train)
+{
+  var.num = ncol(pred.train)
+  var.keep = aic.keep = c()
+  var.rem = 1:var.num
+
+  var = 0
+  while ( var < var.num ) {
+    var = var+1
+    aic.tmp = rep(0,length(var.rem))
+    for ( ii in 1:length(var.rem) ) {
+      var.set = c(var.keep,var.rem[ii])
+      df = pred.train[,var.set]
+      if ( var == 1 ) df = data.frame(df)
+      set.seed(1)
+      model <- suppressWarnings(glm(resp.train~.,data=df,family=binomial))
+      aic.tmp[ii] = summary(model)$aic
+    }
+    if ( length(aic.keep) == 0 || min(aic.tmp) < min(aic.keep) ) {
+      aic.keep = append(aic.keep,min(aic.tmp))
+      w = which.min(aic.tmp)
+      var.keep = append(var.keep,var.rem[w])
+      var.rem = var.rem[-w]
+    } else {
+      break
+    }
+  }
+  return(sort(names(pred.train[var.keep])))
+}
+
+subvars <- log_forward(nonpc.train %>% 
+                      dplyr::select(-label), factor(nonpc.train$label))
+nonpc.train.sub <- nonpc.train %>% select(all_of(subvars),label)
+set.seed(7)
+glm.after.subselect <- suppressMessages(glm(factor(nonpc.train.sub$label)~.,data=nonpc.train.sub, 
+                           family=binomial))
+prob.init <- predict(glm.after.subselect, newdata=nonpc.test, type="response")
+
+roc.glmss <- suppressMessages(roc(nonpc.test$label, prob.init))
+(glmss.auc <- roc.glmss$auc)
+```
+
+
+```{r, lasso regression}
+set.seed(7)
+nonpc.nontrain <- nonpc.train %>% select(-label)
+x <- model.matrix(factor(nonpc.train$label)~., nonpc.train)[,-1]
+y <- factor(nonpc.train$label)
+out.lasso <- glmnet(x, y, alpha = 1, family="binomial")
+plot(out.lasso, xvar="lambda")
+```
+
+```{r lasso regression metrics}
+set.seed(7)
+cv <- cv.glmnet(x, y, alpha=1, family="binomial")
+plot(cv)
+cv$lambda.min
+log(cv$lambda.min)
+coef(out.lasso, cv$lambda.min)
+
+x.test <- model.matrix(factor(nonpc.test$label)~., nonpc.test %>% select(-label))[,-1]
+resp.prob <- predict(out.lasso, s=cv$lambda.min, newx= x.test, type="response")
+resp.pred <- ifelse(resp.prob<0.5, "CP", "FP")
+mean(resp.pred != nonpc.test$label)
+```
+
+```{r ridge regression}
+set.seed(7)
+nonpc.nontrain <- nonpc.train %>% select(-label)
+x <- model.matrix(factor(nonpc.train$label)~., nonpc.train)[,-1]
+y <- factor(nonpc.train$label)
+out.ridge = glmnet(x, y, alpha = 0, family="binomial")
+plot(out.ridge, xvar="lambda")
+
+set.seed(7)
+cv <- cv.glmnet(x, y, alpha = 0, family="binomial")
+plot(cv)
+cv$lambda.min
+log(cv$lambda.min)
+coef(out.ridge, cv$lambda.min)
+```
+
+```{r data manipulation}
+nonpc.train.pred <- nonpc.train %>% select(-label)
+nonpc.train.resp <- nonpc.train$label
+nonpc.test.pred <- nonpc.test %>% select(-label)
+nonpc.test.resp <- nonpc.test$label 
+```
+
+```{r decision tree}
+set.seed(7)
+rpart.out <- rpart(factor(nonpc.train.resp)~., data=nonpc.train.pred)
+plotcp(rpart.out)
+```
+
+```{r pruned decision tree}
+rpart.pruned <- prune(rpart.out, cp=0.025)
+rpart.plot(rpart.pruned)
+resp.pred.rpart <- predict(rpart.pruned, newdata=nonpc.test.pred, type = "prob")[,2]
+roc.rpart <- suppressMessages(roc(nonpc.test.resp, resp.pred.rpart))
+(rpart.auc <- roc.rpart$auc)
+```
+
+```{r random forest}
+set.seed(7)
+rf.out <- randomForest(factor(nonpc.train.resp)~., data=nonpc.train.pred, importance=TRUE)
+varImpPlot(rf.out, type=1)
+pred.rf.class <- predict(rf.out, newdata=nonpc.test.pred, type="prob")[,2]
+roc.rf <- suppressMessages(roc(nonpc.test.resp, pred.rf.class))
+(rf.auc <- roc.rf$auc)
+```
+
+```{r gradient boosting}
+train.mat.xgb <- xgb.DMatrix(data = as.matrix(nonpc.train.pred), label = as.numeric(as.factor(nonpc.train.resp)) - 1)
+test.mat.xgb <- xgb.DMatrix(data = as.matrix(nonpc.test.pred), label = as.numeric(as.factor(nonpc.test.resp)) - 1)
+
+set.seed(7)
+xgb.cv.out.class <- xgb.cv(list(objective = "binary:logistic"), train.mat.xgb, 
+                           nrounds = 30, nfold = 5, eval_metric = "error", verbose = 0)
+rounds <- which.min(xgb.cv.out.class$evaluation_log$test_error_mean)
+set.seed(7)
+xgb.out <- xgboost(train.mat.xgb, nrounds=rounds, params = list(objective="binary:logistic"),
+                   verbose = 0, eval_metric = "error")
+resp.pred <- predict(xgb.out, newdata=test.mat.xgb, type="prob")
+roc.xgb <- suppressMessages(roc(nonpc.test.resp, resp.pred))
+(xgb.auc <- roc.xgb$auc)
+imp.out <- xgb.importance(model=xgb.out)
+xgb.plot.importance(importance_matrix=imp.out,col="blue")
+```
+
+```{r naive bayes}
+set.seed(7)
+nb.out <- naiveBayes(factor(nonpc.train.resp)~.,data=nonpc.train.pred)
+nb.pred <- predict(nb.out,newdata=nonpc.test.pred,type="raw")[,2]
+roc.nb <- suppressMessages(roc(nonpc.test.resp, nb.pred))
+(nb.auc <- roc.nb$auc)
+```
+
+```{r k nearest neighbors}
+k.max <- 20
+mcr.k <- rep(Inf, k.max)
+
+for (ii in 1:k.max) {
+  set.seed(7)
+  knn.out <- knn.cv(train = nonpc.train.pred, cl = nonpc.train.resp, k = ii, algorithm = "brute")  
+  mcr.k[ii] <- length(knn.out[knn.out != nonpc.train.resp])/length(knn.out)
+}
+
+msr.nn <- data.frame(n = 1:k.max, mcr = mcr.k)
+msr.nn %>% 
+  ggplot(mapping = aes(x = n, y = mcr)) +
+  geom_point() + geom_line() +
+  geom_vline(xintercept = which.min(mcr.k), color = "red") +
+  labs(title = "Validation MCR versus the Number of K-Nearest Neighbors",
+       x = "Number of K-Nearest Neighbors",
+       y = "Validation MCR")
+
+(k.opt <- which.min(mcr.k))
+set.seed(7)
+knn.clt.out <- knn(train=nonpc.train.pred, test=nonpc.test.pred, cl=nonpc.train.resp,
+                        k=k.opt, algorithm = "brute", prob=TRUE)
+knn.prob <- attributes(knn.clt.out)$prob
+w <- which(knn.clt.out=="CP")
+knn.prob[w] = 1 - knn.prob[w] 
+roc.knn <- suppressMessages(roc(nonpc.test.resp, knn.prob))
+(knn.auc <- roc.knn$auc)
+```
+
+```{r svm linear, echo=FALSE}
+set.seed(7)
+df <- cbind(nonpc.train.resp, nonpc.train.pred)
+df.test <- cbind(nonpc.test.resp, nonpc.test.pred)
+tuned.linear <- tune(svm, factor(nonpc.train.resp)~., data=df, kernal="linear",
+                     ranges=list(cost = 10^seq(0,1,by=0.2)), probability=TRUE)
+preds <- predict(tuned.linear$best.model, newdata=nonpc.test.pred, probability=TRUE)
+roc.svml <- suppressMessages(roc(nonpc.test.resp, attributes(preds)$probabilities[,2]))
+(svml.auc <- roc.svml$auc)
+tuned.linear$best.parameters
+```
+
+```{r svm polynomial}
+set.seed(7)
+tuned.poly <- tune(svm, factor(nonpc.train.resp)~., data=df, kernel="polynomial",
+                ranges=list(cost=10^seq(2.5,3,by=0.25),degree=1:3), probability=TRUE)
+```
+
+
+```{r svm polynomial II}
+tuned.poly$best.parameters
+preds <- predict(tuned.poly$best.model, newdata=nonpc.test.pred, probability=TRUE)
+roc.svmp <- suppressMessages(roc(nonpc.test.resp, attributes(preds)$probabilities[,2]))
+(svmp.auc <- roc.svmp$auc)
+```
+
+
+```{r svm radial, echo=FALSE}
+set.seed(7)
+tuned.rad <- tune(svm, factor(nonpc.train.resp)~., data=df, kernal="radial",
+                     ranges=list(cost=10^seq(1,2,by=0.5), gamma=10^seq(-2,-1,by=0.5)), probability=TRUE)
+# tuned.rad$best.parameters
+preds <- predict(tuned.rad$best.model, newdata=nonpc.test.pred, probability=TRUE)
+roc.svmr <- suppressMessages(roc(nonpc.test.resp, attributes(preds)$probabilities[,2]))
+(svmr.auc <- roc.svmr$auc)
+```
+
+```{r final conclusions and calculations}
+plot(roc.rf, col="navyblue")
+title("ROC Curve for Random Forest Model")
+
+preds <- predict(rf.out, newdata=nonpc.test.pred, type="prob")[,2]
+predictions <- rep("CP", nrow(nonpc.test.pred))
+(threshold <- roc.rf$thresholds[which.max(roc.rf$sensitivities + roc.rf$specificities - 1)])
+predictions <- ifelse(preds > threshold, "FP", "CP")
+table(nonpc.test.resp, predictions)
+mean(nonpc.test.resp != predictions)
+
+pc.pred <- predict(rf.out, newdata = toi.df.pc)
+table(pc.pred)
+```
+
+```{r roc curves, out.width="80%", echo=FALSE}
+colors = c("navyblue","yellow","orange","red","blue","green","violet","black","pink","grey")
+plot(roc.knn, col="grey")
+plot(roc.nb, col="pink", add=TRUE)
+plot(roc.rpart, col="black", add=TRUE)
+plot(roc.svmp, col="violet", add=TRUE)
+plot(roc.glm, col="green", add=TRUE)
+plot(roc.glmss, col="blue", add=TRUE)
+plot(roc.svmr, col="red", add=TRUE)
+plot(roc.xgb, col="orange", add=TRUE)
+plot(roc.svml, col="yellow", add=TRUE)
+plot(roc.rf, col="navyblue", add=TRUE)
+legend("bottomright", 
+       legend=c(as.expression(bquote(bold("Random Forest"))),
+                paste("Support Vector Machine (Kernal: Linear)"),
+                paste("Gradient Boosting"),
+                paste("Support Vector Machine (Kernal: Radial)"),
+                paste("Logistic Regression (Subset Selection with AIC)"),
+                paste("Logistic Regression"),
+                paste("Support Vector Machine (Kernal: Polynomial)"),
+                paste("Decision Tree"),
+                paste("Naive Bayes"),
+                paste("K-Nearest Neighbors (KNN)")),
+       col=colors, lty=1, cex=0.6)
+title("ROC Curves for Different Classification Techniques")
+``` 
